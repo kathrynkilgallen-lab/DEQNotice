@@ -1,0 +1,157 @@
+import time
+from urllib.parse import urljoin
+import pandas as pd
+import requests
+from bs4 import BeautifulSoup
+
+
+def fetch_nc_deq_notices(search_query="Lake James", max_pages=5):
+    """Scrapes NC DEQ public notices matching a given search query.
+
+    Args:
+        search_query (str): Keyword to search for (e.g., 'Lake James', 'Burke').
+        max_pages (int): Maximum number of search pages to iterate through.
+
+    Returns:
+        pd.DataFrame: DataFrame containing matching public notices.
+    """
+    base_url = "https://www.deq.nc.gov/public-notices-hearings"
+
+    # User-Agent header to prevent being blocked by server requests
+    headers = {
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/115.0.0.0 Safari/537.36"
+        )
+    }
+
+    results = []
+
+    for page in range(max_pages):
+        # Query parameters matching NC DEQ's Drupal views search
+        params = {
+            "field_agency_department_target_id": "All",
+            "combine": search_query,
+            "page": page,
+        }
+
+        print(
+            f"Fetching page {page + 1} for keyword: '{search_query}'..."
+        )
+
+        try:
+            response = requests.get(
+                base_url, params=params, headers=headers, timeout=10
+            )
+            response.raise_for_status()
+        except requests.RequestException as e:
+            print(f"Error fetching page {page + 1}: {e}")
+            break
+
+        soup = BeautifulSoup(response.text, "html.parser")
+
+        # Select individual notice rows/cards from the views table/list
+        items = soup.select(".views-row, article, .node")
+
+        # The `if not items: break` condition was removed here to allow
+        # the loop to continue for `max_pages` iterations, stopping only
+        # if there's no 'next' pagination button.
+        # This ensures all intended pages are checked, even if some intermediate
+        # pages might appear empty due to filtering or other website logic,
+        # as long as a 'next' button exists.
+
+        for item in items:
+            # Extract Notice Title & Link
+            title_elem = item.find(["h2", "h3", "h4"]) or item.find("a")
+            if not title_elem:
+                continue
+
+            link_tag = (
+                item.find("a") if title_elem.name != "a" else title_elem
+            )
+            title = title_elem.get_text(strip=True)
+
+            link = ""
+            if link_tag and link_tag.has_attr("href"):
+                link = urljoin(base_url, link_tag["href"])
+
+            # Extract Notice Dates
+            date_elem = item.find(["time", "span", "div"], class_=lambda c: c and "date" in c.lower())
+            date_text = date_elem.get_text(strip=True) if date_elem else "N/A"
+
+            # Extract Summary snippet
+            summary_elem = item.find(
+                "div",
+                class_=lambda c: c
+                and any(
+                    x in c.lower()
+                    for x in ["body", "teaser", "summary", "field-content"]
+                ),
+            )
+            summary = (
+                summary_elem.get_text(strip=True)
+                if summary_elem
+                else item.get_text(strip=True)
+            )
+
+            # Limit summary length for readability
+            if len(summary) > 250:
+                summary = summary[:247] + "..."
+
+            results.append(
+                {
+                    "Title": title,
+                    "Date": date_text,
+                    "Link": link,
+                    "Summary": summary,
+                }
+            )
+
+        # Check if a 'Next' pagination link exists
+        next_button = soup.select_one("li.pager__item--next a, li.next a")
+        if not next_button:
+            print("No more pages found.") # Added for clarity
+            break
+
+        time.sleep(1)  # Respectful rate limiting
+
+    df = pd.DataFrame(results)
+    if not df.empty:
+        df = df.drop_duplicates(subset=["Title", "Link"])
+
+    return df
+
+
+if __name__ == "__main__":
+    # Primary search for 'Lake James'
+    print("=== Searching NC DEQ Public Notices for 'Lake James' ===")
+    # To go through all 3 pages, set max_pages=3 here or in the function definition.
+    df_notices = fetch_nc_deq_notices(search_query="Lake James")
+
+    # Fallback search for regional counties if direct lake hits are minimal
+    if df_notices.empty:
+        print(
+            "\nNo direct matches for 'Lake James'. Searching broader region (Burke & McDowell & Avery Counties)..."
+        )
+        # Corrected search queries for Burke and Avery counties
+        df_burke = fetch_nc_deq_notices(search_query="Burke")
+        df_mcdowell = fetch_nc_deq_notices(search_query="McDowell")
+        df_avery = fetch_nc_deq_notices(search_query="Avery")
+
+        df_notices = pd.concat(
+            [df_burke, df_mcdowell, df_avery], ignore_index=True
+        ).drop_duplicates(subset=["Title", "Link"])
+
+    print(f"\nFound {len(df_notices)} total record(s):\n")
+
+    for idx, row in df_notices.iterrows():
+        print(f"[{idx + 1}] {row['Title']}")
+        print(f"    Date: {row['Date']}")
+        print(f"    URL:  {row['Link']}")
+        print(f"    Summary: {row['Summary']}\n" + "-" * 60)
+
+    # Export results to CSV
+    output_filename = "nc_deq_lake_james_notices.csv"
+    df_notices.to_csv(output_filename, index=False)
+    print(f"\nResults saved to '{output_filename}'")
